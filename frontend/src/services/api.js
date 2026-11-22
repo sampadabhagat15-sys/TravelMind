@@ -1,5 +1,6 @@
 
-const API_BASE_URL = "http://127.0.0.1:8001";
+const API_BASE_URL =
+  import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8001";
 
 export async function generateItinerary(message) {
   const response = await fetch(`${API_BASE_URL}/plan`, {
@@ -7,23 +8,13 @@ export async function generateItinerary(message) {
     headers: {
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      message: message,
-    }),
+    body: JSON.stringify({ message }),
   });
 
   if (!response.ok) {
-    let errorMessage = "Failed to generate itinerary.";
-
-    try {
-      const errorData = await response.json();
-      errorMessage = errorData.detail || errorMessage;
-    } catch {
-      // Use the default error message.
-    }
-
-    throw new Error(errorMessage);
+    throw new Error("Failed to generate itinerary. Please try again.");
   }
 
-  return await response.json();
+  return response.json();
 }
+
