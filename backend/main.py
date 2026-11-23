@@ -94,3 +94,12 @@ def plan_trip(request: TravelRequest):
             status_code=500,
             detail="Travel planning failed. Please try again."
         ) from error
+@app.get("/debug/weather")
+def debug_weather():
+    from backend.tools import get_weather_forecast
+
+    return get_weather_forecast.invoke({
+        "city": "Haridwar",
+        "start_date": "2026-11-25",
+        "duration": 3
+    })
