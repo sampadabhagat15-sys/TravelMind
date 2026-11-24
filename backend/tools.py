@@ -2,7 +2,7 @@ import os
 import requests
 import time
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from dotenv import load_dotenv
 from langchain_core.tools import tool
 
@@ -102,8 +102,8 @@ def interpret_weather_code(code):
 
 
 def weather_request(url, params):
-    """Retry transient weather-service failures, at most three attempts."""
-    for attempt in range(3):
+    """Retry transient weather-service failures, at most two attempts."""
+    for attempt in range(2):
         try:
             response = requests.get(url, params=params, timeout=(5, 15))
             response.raise_for_status()
@@ -111,11 +111,11 @@ def weather_request(url, params):
         except requests.exceptions.RequestException as exc:
             status = exc.response.status_code if exc.response is not None else None
             retryable = (
-                status in (429, 500, 502, 503, 504)
+                status in (500, 502, 503, 504)
                 or isinstance(exc, (requests.exceptions.Timeout,
                                     requests.exceptions.ConnectionError))
             )
-            if not retryable or attempt == 2:
+            if not retryable or attempt == 1:
                 raise
             time.sleep(1 + attempt)
 
@@ -124,8 +124,7 @@ def weather_request(url, params):
 # TOOL 2: DATE-SPECIFIC WEATHER FORECAST
 # ==========================================
 
-@tool
-def get_weather_forecast(
+def _open_meteo_forecast(
     city: str,
     start_date: str = "",
     duration: int = 1
@@ -327,6 +326,100 @@ def get_weather_forecast(
             "stage": stage,
             "error_type": category
         }
+
+
+# In-memory cache, shared by requests within this backend process.
+from copy import deepcopy
+from threading import Lock
+
+_weather_cache = {}
+_weather_lock = Lock()
+
+
+def _fallback_weather(city, start_date, duration):
+    key = os.getenv('WEATHERAPI_KEY')
+    if not key:
+        return {'error': 'Fallback weather API key is missing.'}
+    try:
+        response = requests.get(
+            'https://api.weatherapi.com/v1/forecast.json',
+            params={'key': key, 'q': city, 'days': 3, 'aqi': 'no', 'alerts': 'no'},
+            timeout=(5, 12))
+        response.raise_for_status()
+        data = response.json()
+        location = data['location']
+        today = date.fromisoformat(location['localtime'][:10])
+        start = date.fromisoformat(start_date) if start_date else today
+        if start < today:
+            return {'error': 'Past travel dates are not supported.'}
+        days = {d['date']: d['day'] for d in data['forecast']['forecastday']}
+        forecasts, missing = [], []
+        for i in range(duration):
+            day = (start + timedelta(days=i)).isoformat()
+            if day not in days:
+                missing.append(day)
+                continue
+            d = days[day]
+            forecasts.append({'day': i+1, 'date': day,
+                'condition': d['condition']['text'],
+                'max_temperature_c': d.get('maxtemp_c'),
+                'min_temperature_c': d.get('mintemp_c'),
+                'rain_probability_percent': d.get('daily_chance_of_rain'),
+                'source': 'WeatherAPI.com'})
+        return {'city': location['name'], 'country': location['country'],
+            'latitude': location['lat'], 'longitude': location['lon'],
+            'timezone': location['tz_id'], 'travel_start_date': start.isoformat(),
+            'travel_end_date': (start + timedelta(days=duration-1)).isoformat(),
+            'forecast_available_until': max(days, default=None),
+            'forecasts': forecasts, 'unavailable_dates': missing,
+            'source': 'WeatherAPI.com',
+            'status': ('Forecast unavailable for all travel dates' if not forecasts else
+                       'Partial forecast available' if missing else 'Complete forecast available'),
+            'note': 'Fallback forecasts cover up to three days including today. Do not invent weather for unavailable dates.'}
+    except Exception as exc:
+        # Never expose exception URLs, which may contain the API key.
+        response = getattr(exc, 'response', None)
+        return {'error': 'Fallback weather service failed.',
+                'http_status': response.status_code if response is not None else None,
+                'error_type': type(exc).__name__}
+
+
+@tool
+def get_weather_forecast(city: str, start_date: str = '', duration: int = 1) -> dict:
+    """Get real daily weather for a city and travel dates (YYYY-MM-DD), for 1–30 days. Uses Open-Meteo and a WeatherAPI fallback. Never invent unavailable forecasts."""
+    if not city.strip() or not 1 <= duration <= 30:
+        return {'error': 'Provide a city and duration between 1 and 30 days.'}
+    if start_date:
+        try:
+            start_date = datetime.strptime(start_date, '%Y-%m-%d').date().isoformat()
+        except ValueError:
+            return {'error': 'Use YYYY-MM-DD date format.'}
+    cache_key = (city.strip().casefold(), start_date, duration)
+    now = time.monotonic()
+    with _weather_lock:
+        cached = _weather_cache.get(cache_key)
+        if cached and now - cached[0] < 900:
+            result = deepcopy(cached[1])
+            result['cached'] = True
+            return result
+    primary = _open_meteo_forecast(city, start_date, duration)
+    if 'error' not in primary:
+        result = primary
+        result['source'] = 'Open-Meteo'
+    elif primary.get('error') == 'Past travel dates are not supported.':
+        return primary
+    else:
+        result = _fallback_weather(city, start_date, duration)
+        if 'error' in result:
+            return {'error': 'Both weather providers failed.', 'primary': primary, 'fallback': result}
+    result['cached'] = False
+    result['retrieved_at_utc'] = datetime.now(timezone.utc).isoformat()
+    if result.get('forecasts'):
+        with _weather_lock:
+            if len(_weather_cache) >= 256:
+                _weather_cache.pop(next(iter(_weather_cache)))
+            _weather_cache[cache_key] = (time.monotonic(), deepcopy(result))
+    return result
 
 
 # ==========================================
