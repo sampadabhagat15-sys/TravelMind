@@ -1,4 +1,3 @@
-
 import os
 
 from dotenv import load_dotenv
@@ -197,6 +196,9 @@ agent = create_agent(
 # ==========================================
 # TEST AGENT INDEPENDENTLY
 # ==========================================
+# ==========================================
+# TEST AGENT INDEPENDENTLY
+# ==========================================
 
 if __name__ == "__main__":
 
@@ -236,12 +238,16 @@ if __name__ == "__main__":
 
     print(result["messages"][-1].text)
 
-    print("\n===== TOOLS USED =====\n")
+    print("\n===== AGENT TOOL DIAGNOSTICS =====\n")
 
     for message in result["messages"]:
 
         for call in getattr(message, "tool_calls", []) or []:
+            print("\nTOOL CALLED:", call["name"])
+            print("ARGUMENTS:", call.get("args"))
 
-            print("-", call["name"])
+        if getattr(message, "type", "") == "tool":
+            print("\nTOOL RESULT:", getattr(message, "name", "unknown"))
+            print(message.content)
 
 

@@ -1,6 +1,6 @@
-
 import os
 import requests
+import time
 
 from datetime import date, datetime, timedelta
 from dotenv import load_dotenv
@@ -101,6 +101,25 @@ def interpret_weather_code(code):
     return weather_codes.get(code, "Unknown weather condition")
 
 
+def weather_request(url, params):
+    """Retry transient weather-service failures, at most three attempts."""
+    for attempt in range(3):
+        try:
+            response = requests.get(url, params=params, timeout=(5, 15))
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            retryable = (
+                status in (429, 500, 502, 503, 504)
+                or isinstance(exc, (requests.exceptions.Timeout,
+                                    requests.exceptions.ConnectionError))
+            )
+            if not retryable or attempt == 2:
+                raise
+            time.sleep(1 + attempt)
+
+
 # ==========================================
 # TOOL 2: DATE-SPECIFIC WEATHER FORECAST
 # ==========================================
@@ -126,6 +145,7 @@ def get_weather_forecast(
     window must not be treated as confirmed weather.
     """
 
+    stage = "geocoding"
     try:
 
         if duration < 1 or duration > 30:
@@ -139,19 +159,16 @@ def get_weather_forecast(
             "https://geocoding-api.open-meteo.com/v1/search"
         )
 
-        geo_response = requests.get(
+        geo_data = weather_request(
             geo_url,
             params={
                 "name": city,
                 "count": 1,
                 "language": "en",
                 "format": "json"
-            },
-            timeout=15
+            }
         )
 
-        geo_response.raise_for_status()
-        geo_data = geo_response.json()
 
         if not geo_data.get("results"):
             return {
@@ -165,11 +182,12 @@ def get_weather_forecast(
 
         # STEP 2: GET DAILY WEATHER FORECAST
 
+        stage = "forecast"
         weather_url = (
             "https://api.open-meteo.com/v1/forecast"
         )
 
-        weather_response = requests.get(
+        weather_data = weather_request(
             weather_url,
             params={
                 "latitude": latitude,
@@ -182,12 +200,9 @@ def get_weather_forecast(
                 ),
                 "forecast_days": 16,
                 "timezone": "auto"
-            },
-            timeout=15
+            }
         )
 
-        weather_response.raise_for_status()
-        weather_data = weather_response.json()
 
         daily = weather_data.get("daily", {})
         available_dates = daily.get("time", [])
@@ -197,6 +212,7 @@ def get_weather_forecast(
                 "error": "Weather forecast data is unavailable."
             }
 
+        stage = "forecast processing"
         # STEP 3: VALIDATE TRAVEL DATES
 
         today = date.fromisoformat(available_dates[0])
@@ -292,14 +308,24 @@ def get_weather_forecast(
             )
         }
 
-    except requests.exceptions.RequestException:
+    except requests.exceptions.RequestException as exc:
+        status = exc.response.status_code if exc.response is not None else None
+        category = type(exc).__name__
+        print(f"Weather failure: stage={stage}, type={category}, HTTP={status}", flush=True)
         return {
-            "error": "Unable to connect to the weather service."
+            "error": "Weather service request failed.",
+            "stage": stage,
+            "error_type": category,
+            "http_status": status
         }
 
-    except Exception:
+    except Exception as exc:
+        category = type(exc).__name__
+        print(f"Weather failure: stage={stage}, type={category}", flush=True)
         return {
-            "error": "Unable to process the weather forecast."
+            "error": "Unable to process the weather forecast.",
+            "stage": stage,
+            "error_type": category
         }
 
 
